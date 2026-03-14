@@ -1,9 +1,11 @@
 """
 Paleontology Research Assistant -- Agent Loop
-V0.9: Replace arXiv retrieval with Semantic Scholar. arXiv returns HTTP 429
-      on Streamlit Cloud due to shared-IP rate limiting. Semantic Scholar is
-      free, requires no authentication, is cloud-friendly, and covers the
-      same paleontology literature via a plain JSON REST API.
+V1.0: Add deterministic source quality scoring. Tier rules are injected into
+      the system prompt before every API call so Claude can prioritise high-
+      quality sources during synthesis. After the response is received,
+      _annotate_tier_labels() scores each Sources bullet by keyword-matching
+      the URL and title, logs the match, and appends [T1]-[T4] in-place.
+      No LLM involvement in scoring; all pattern matching is pure Python.
 """
 
 import json
@@ -42,6 +44,100 @@ TOOLS = [
     }
 ]
 
+# -- Source tier keyword lists -------------------------------------------------
+# Matched in priority order (T1 first) against the lowercased source line,
+# which typically contains both the URL and the title as written by Claude.
+# T4 is the fallback when nothing matches.
+
+_TIER1_KEYWORDS = [
+    # Publisher domains
+    "nature.com", "sciencemag.org", "science.org/doi",
+    "plos.org", "plosone.org",
+    "cell.com", "thecellpress",
+    "elifesciences.org",
+    "royalsocietypublishing.org",
+    "academic.oup.com",
+    "cambridge.org/core",
+    "biorxiv.org",
+    "peerj.com",
+    "jstor.org",
+    "pubmed", "ncbi.nlm.nih.gov",
+    "doi.org/10.",
+    "vertpaleo.org",
+    "paleosoc.org",
+    "pensoft.net",
+    # Specific journal names (as Claude would write them in a citation)
+    "journal of vertebrate paleontology",
+    "journal of systematic palaeontology",
+    "journal of systematic paleontology",
+    "journal of paleontology",
+    "cretaceous research",
+    "palaeogeography",
+    "acta palaeontologica polonica",
+    "proceedings of the royal society",
+    "proc. r. soc",
+    "plos one", "plos biology",
+    "science advances",
+    "current biology",
+    "nature ecology", "nature communications",
+    "scientific reports",
+    "zookeys",
+    "peerj",
+    "elife",
+]
+
+_TIER2_KEYWORDS = [
+    # TLD patterns — reliable institutional indicators
+    ".edu", ".ac.uk", ".ac.jp", ".ac.au", ".ac.nz",
+    ".gov",
+    # Specific museum / institution domains
+    "nhm.ac.uk", "nhm.org",
+    "amnh.org",
+    "fieldmuseum.org",
+    "si.edu",
+    "ucmp.berkeley",
+    "peabody.yale",
+    "paleobiodb.org",
+    "fossilworks.org",
+    "usgs.gov", "nps.gov",
+    # Text patterns that appear in Claude's citations
+    "natural history museum",
+    "university press",
+    "smithsonian institution",
+    "carnegie museum",
+    "royal tyrrell",
+    "american museum of natural history",
+    "vertebrate paleontology lab",
+]
+
+_TIER3_KEYWORDS = [
+    # Science journalism outlets (URL fragments and publication names)
+    "bbc.com", "bbc.co.uk",
+    "npr.org",
+    "nationalgeographic.com", "natgeo.com",
+    "sciencedaily.com", "sciencedaily",
+    "scientificamerican.com", "scientific american",
+    "sciencenews.org", "science news",
+    "smithsonianmag.com", "smithsonian magazine",
+    "livescience.com", "livescience",
+    "phys.org",
+    "newscientist.com", "new scientist",
+    "wired.com",
+    "discovermagazine.com", "discover magazine",
+    "eos.org",
+    "theatlantic.com",
+    "popsci.com", "popular science",
+    "popularmechanics.com",
+    # Names as written in citations (no URL present)
+    "national geographic",
+    "science daily",
+]
+
+# Regex to strip any existing [T1]-[T4] label before re-annotating,
+# preventing double-labelling when Claude follows the system prompt instruction.
+_EXISTING_TIER_LABEL = re.compile(r"\s*\[T[1-4]\]\s*$")
+
+
 # -- System prompt -------------------------------------------------------------
 SYSTEM_PROMPT = """You are a paleontology research assistant with access to live web search
 and pre-fetched Semantic Scholar abstracts supplied in the user message.
@@ -70,6 +166,19 @@ this exact format:
 - [open question 1]
 - [open question 2]
 
+Source quality tiers — apply [T1]-[T4] labels in the Sources section:
+  [T1] Peer-reviewed journal (Nature, Science, PLOS, Cell, Royal Society,
+       Oxford/Cambridge journals, Journal of Vertebrate Paleontology,
+       Journal of Systematic Palaeontology, Cretaceous Research, etc.)
+  [T2] Institutional or museum source (.edu, .gov, natural history museum,
+       university press release, government agency, paleontology database)
+  [T3] Science journalism (NPR, BBC, National Geographic, Scientific American,
+       ScienceDaily, Smithsonian Magazine, New Scientist, LiveScience)
+  [T4] General news or blog
+
+When T1 or T2 sources conflict with T3 or T4 on the same finding, weight
+the higher-tier source. Add a [T1]-[T4] label to every Sources bullet.
+
 Always use web search before answering. Incorporate Semantic Scholar abstracts where relevant.
 Cite academic papers in the arXiv Papers section using their IDs.
 Cite web results in Sources. Be specific and accurate. If you are uncertain
@@ -77,11 +186,66 @@ about something, say so rather than speculating.
 Keep findings concise -- one to two sentences each."""
 
 
+# -- Source quality scoring ----------------------------------------------------
+def _score_source(line: str) -> tuple[int, str]:
+    """
+    Deterministically assign a quality tier to a source line.
+
+    Checks keyword lists in priority order (T1 -> T2 -> T3 -> T4 default).
+    Matching is case-insensitive substring search on the full line, which
+    typically contains both URL and title as written by Claude.
+
+    Returns (tier: int, matched_keyword: str) for logging.
+    """
+    t = line.lower()
+    for kw in _TIER1_KEYWORDS:
+        if kw in t:
+            return 1, kw
+    for kw in _TIER2_KEYWORDS:
+        if kw in t:
+            return 2, kw
+    for kw in _TIER3_KEYWORDS:
+        if kw in t:
+            return 3, kw
+    return 4, "(no keyword matched)"
+
+
+def _annotate_tier_labels(text: str) -> str:
+    """
+    Post-process the response text to add deterministic [T1]-[T4] labels.
+
+    Locates the '### Sources' section, scores every bullet line via
+    _score_source(), strips any label Claude may have already added to
+    prevent duplicates, appends the authoritative label, and logs each
+    assignment.  Lines outside the Sources section are returned unchanged.
+    """
+    lines = text.split("\n")
+    result = []
+    in_sources = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Detect section boundaries
+        if stripped.startswith("### Sources"):
+            in_sources = True
+            result.append(line)
+            continue
+        if in_sources and stripped.startswith("##"):
+            in_sources = False
+
+        if in_sources and stripped.startswith("- "):
+            base = _EXISTING_TIER_LABEL.sub("", line.rstrip())
+            tier, matched = _score_source(base)
+            logger.info("Source tier T%d (matched %r): %s", tier, matched, base.strip()[:100])
+            result.append(base + " [T" + str(tier) + "]")
+        else:
+            result.append(line)
+
+    return "\n".join(result)
+
+
 # -- Semantic Scholar query construction ---------------------------------------
-# Strip conversational prefixes ("What is", "Tell me about", etc.) so the
-# core subject terms reach the S2 search engine. S2 uses natural-language
-# relevance ranking, not arXiv-style boolean syntax, so we append a single
-# paleontology anchor term only when the query doesn't already contain one.
 _QUESTION_PREFIX = re.compile(
     r"(?i)^\s*"
     r"(?:what(?:\s+(?:is|are|was|were|do|does|did))?|how|why|when|where|who|which|"
@@ -103,11 +267,7 @@ def _build_s2_query(user_query: str) -> str:
 
     1. Strip leading question words / conversational prefixes.
     2. Remove trailing punctuation.
-    3. Append "paleontology" if no domain term is already present, so generic
-       subjects (e.g. "locomotion", "bone structure") return on-topic papers.
-
-    S2 uses its own relevance ranking over plain keyword queries; boolean
-    operators (AND/OR) are not needed and can hurt precision here.
+    3. Append "paleontology" if no domain term is already present.
     """
     q = _QUESTION_PREFIX.sub("", user_query).rstrip("?.! ").strip()
     if not q:
@@ -123,15 +283,8 @@ def _fetch_semantic_scholar(query: str) -> str:
     """
     Fetch academic abstracts from the Semantic Scholar Graph API.
 
-    Endpoint: GET https://api.semanticscholar.org/graph/v1/paper/search
-    Fields:   title, authors, year, abstract, externalIds
-    Auth:     none required for unauthenticated access (rate-limited to
-              ~100 req/s across all anonymous callers — well within app usage)
-
     Returns a formatted string ready to inject into the user message, or an
-    empty string if no results are found or the request fails (fails loudly
-    with exception type logged so cloud-side errors are diagnosable).
-
+    empty string if no results are found or the request fails.
     Paper identifier priority: ArXiv ID > DOI > S2 paperId.
     """
     logger.info("Fetching Semantic Scholar abstracts for: %r", query)
@@ -146,7 +299,7 @@ def _fetch_semantic_scholar(query: str) -> str:
 
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": "paleo-research-assistant/0.9 (research tool)"},
+            headers={"User-Agent": "paleo-research-assistant/1.0 (research tool)"},
         )
         with urllib.request.urlopen(req, timeout=S2_TIMEOUT) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
@@ -223,14 +376,14 @@ def run_agent(query: str, history: list | None = None) -> str:
              Pass None or [] for the first turn.
 
     Steps:
-      1. Pre-fetch Semantic Scholar abstracts for the current query and inject
-         into the current user message (prior turns are not re-augmented).
+      1. Pre-fetch Semantic Scholar abstracts; inject into current user message.
       2. Build messages = history + [current user message].
       3. Run the agentic loop with native web search.
       4. Concatenate all text blocks from the final response.
+      5. Apply deterministic tier labels to the Sources section.
 
     stop_reason flow:
-      end_turn   -> done; extract and return text.
+      end_turn   -> done; extract, annotate tiers, and return text.
       pause_turn -> server hit its iteration cap; append and continue.
     """
     logger.info("Agent received query: %r (history turns: %d)", query, len(history or []))
@@ -268,6 +421,7 @@ def run_agent(query: str, history: list | None = None) -> str:
             if response.stop_reason == "end_turn":
                 text = _extract_final_text(response.content)
                 if text:
+                    text = _annotate_tier_labels(text)
                     logger.info("Agent completed successfully.")
                     return text
                 return "## Research Summary\n\n**Status:** No text response received."
