@@ -1,15 +1,17 @@
 """
 Paleontology Research Assistant -- Agent Loop
-V0.7: Multi-turn support. run_agent accepts a history list of prior
-      {"role", "content"} pairs and prepends them to the messages array
-      so follow-up questions have full prior context.
-      History entries use plain text only -- no server_tool_use or
-      web_search_tool_result blocks -- keeping context compact.
+V0.8: Replace arxiv library with direct urllib + ElementTree calls to the
+      arXiv REST API. The library uses feedparser which silently swallows
+      connection/parse failures on Streamlit Cloud (no exception raised,
+      empty list returned). Direct HTTP with an explicit timeout and stdlib
+      XML parsing gives reliable failure visibility and cloud compatibility.
 """
 
 import logging
 import re
-import arxiv
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 import anthropic
 from dotenv import load_dotenv
 
@@ -30,6 +32,7 @@ MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
 MAX_LOOP_ITERATIONS = 5    # guard against runaway loops
 ARXIV_MAX_RESULTS = 5
+ARXIV_TIMEOUT = 15         # seconds; feedparser had no timeout at all
 
 # -- Tools ---------------------------------------------------------------------
 TOOLS = [
@@ -91,6 +94,13 @@ _PALEO_ANCHOR = (
     "palaeontology OR palaeobiology OR extinct OR prehistoric)"
 )
 
+# arXiv Atom XML namespaces
+_ATOM = "{http://www.w3.org/2005/Atom}"
+_ARXIV_NS = "{http://arxiv.org/schemas/atom}"
+
+# arXiv API base URL (HTTPS)
+_ARXIV_API = "https://export.arxiv.org/api/query"
+
 
 def _build_arxiv_query(user_query: str) -> str:
     """
@@ -115,38 +125,71 @@ def _build_arxiv_query(user_query: str) -> str:
 # -- arXiv pre-fetch -----------------------------------------------------------
 def _fetch_arxiv_abstracts(query: str) -> str:
     """
-    Search arXiv for abstracts relevant to the query.
-    Returns a formatted string ready to inject into the user message, or an
-    empty string if no results are found or the request fails.
+    Fetch arXiv abstracts via direct HTTP to the arXiv REST API.
+
+    Uses urllib (stdlib) instead of the arxiv library because feedparser
+    (used internally by the library) silently returns empty results on
+    connection/parse failures — no exception is raised, so cloud-side
+    network errors are invisible. Direct HTTP with an explicit timeout
+    surfaces failures as real exceptions that land in the warning log.
+
+    Returns a formatted string ready to inject into the user message, or
+    an empty string if no results are found or the request fails.
     """
     logger.info("Fetching arXiv abstracts for: %r", query)
     try:
-        search = arxiv.Search(
-            query=_build_arxiv_query(query),
-            max_results=ARXIV_MAX_RESULTS,
-            sort_by=arxiv.SortCriterion.Relevance,
+        params = urllib.parse.urlencode({
+            "search_query": _build_arxiv_query(query),
+            "max_results": ARXIV_MAX_RESULTS,
+            "sortBy": "relevance",
+        })
+        url = f"{_ARXIV_API}?{params}"
+        logger.info("arXiv URL: %s", url)
+
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "paleo-research-assistant/0.8 (research tool)"},
         )
-        papers = list(arxiv.Client().results(search))
-        if not papers:
-            logger.info("arXiv: no results.")
+        with urllib.request.urlopen(req, timeout=ARXIV_TIMEOUT) as resp:
+            xml_bytes = resp.read()
+
+        root = ET.fromstring(xml_bytes)
+        entries = root.findall(f"{_ATOM}entry")
+
+        if not entries:
+            logger.info("arXiv: no results for this query.")
             return ""
-        logger.info("arXiv: %d result(s) retrieved.", len(papers))
+
+        logger.info("arXiv: %d result(s) retrieved.", len(entries))
         sections = []
-        for paper in papers:
-            authors = ", ".join(str(a) for a in paper.authors[:3])
-            if len(paper.authors) > 3:
-                authors += " et al."
-            year = paper.published.year if paper.published else "n.d."
+        for entry in entries:
+            title = (entry.findtext(f"{_ATOM}title") or "").strip().replace("\n", " ")
+            summary = (entry.findtext(f"{_ATOM}summary") or "").strip()
+            published = (entry.findtext(f"{_ATOM}published") or "")
+            year = published[:4] if published else "n.d."
+            arxiv_id = (entry.findtext(f"{_ATOM}id") or "").strip()
+
+            author_names = [
+                (a.findtext(f"{_ATOM}name") or "").strip()
+                for a in entry.findall(f"{_ATOM}author")
+            ]
+            author_names = [n for n in author_names if n]
+            author_str = ", ".join(author_names[:3])
+            if len(author_names) > 3:
+                author_str += " et al."
+
             block = (
-                "Title: " + paper.title + "\n"
-                + "Authors: " + authors + " (" + str(year) + ")\n"
-                + "arXiv ID: " + paper.entry_id + "\n"
-                + "Abstract: " + paper.summary
+                "Title: " + title + "\n"
+                + "Authors: " + author_str + " (" + year + ")\n"
+                + "arXiv ID: " + arxiv_id + "\n"
+                + "Abstract: " + summary
             )
             sections.append(block)
+
         return "\n\n---\n\n".join(sections)
+
     except Exception as exc:
-        logger.warning("arXiv fetch failed: %s", exc)
+        logger.warning("arXiv fetch failed (%s): %s", type(exc).__name__, exc)
         return ""
 
 
