@@ -1,17 +1,16 @@
 """
 Paleontology Research Assistant -- Agent Loop
-V0.8: Replace arxiv library with direct urllib + ElementTree calls to the
-      arXiv REST API. The library uses feedparser which silently swallows
-      connection/parse failures on Streamlit Cloud (no exception raised,
-      empty list returned). Direct HTTP with an explicit timeout and stdlib
-      XML parsing gives reliable failure visibility and cloud compatibility.
+V0.9: Replace arXiv retrieval with Semantic Scholar. arXiv returns HTTP 429
+      on Streamlit Cloud due to shared-IP rate limiting. Semantic Scholar is
+      free, requires no authentication, is cloud-friendly, and covers the
+      same paleontology literature via a plain JSON REST API.
 """
 
+import json
 import logging
 import re
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
 import anthropic
 from dotenv import load_dotenv
 
@@ -31,8 +30,8 @@ client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from .env automaticall
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
 MAX_LOOP_ITERATIONS = 5    # guard against runaway loops
-ARXIV_MAX_RESULTS = 5
-ARXIV_TIMEOUT = 15         # seconds; feedparser had no timeout at all
+S2_MAX_RESULTS = 5
+S2_TIMEOUT = 15            # seconds
 
 # -- Tools ---------------------------------------------------------------------
 TOOLS = [
@@ -45,9 +44,9 @@ TOOLS = [
 
 # -- System prompt -------------------------------------------------------------
 SYSTEM_PROMPT = """You are a paleontology research assistant with access to live web search
-and pre-fetched arXiv abstracts supplied in the user message.
+and pre-fetched Semantic Scholar abstracts supplied in the user message.
 Use web search to retrieve current findings, then synthesise both the web
-results and the provided arXiv abstracts into a structured summary using
+results and the provided academic abstracts into a structured summary using
 this exact format:
 
 ## Research Summary
@@ -60,8 +59,8 @@ this exact format:
 - [finding 3]
 
 ### arXiv Papers
-- [paper title, authors, year, arXiv ID]
-- [paper title, authors, year, arXiv ID]
+- [paper title, authors, year, paper ID]
+- [paper title, authors, year, paper ID]
 
 ### Sources
 - [web source or reference 1]
@@ -71,125 +70,125 @@ this exact format:
 - [open question 1]
 - [open question 2]
 
-Always use web search before answering. Incorporate arXiv abstracts where relevant.
-Cite arXiv papers in the arXiv Papers section using their IDs.
+Always use web search before answering. Incorporate Semantic Scholar abstracts where relevant.
+Cite academic papers in the arXiv Papers section using their IDs.
 Cite web results in Sources. Be specific and accurate. If you are uncertain
 about something, say so rather than speculating.
 Keep findings concise -- one to two sentences each."""
 
 
-# -- arXiv query construction --------------------------------------------------
-# Strips conversational prefixes so "What dinosaurs were found in 2024?"
-# becomes "dinosaurs were found in 2024", then ANDs with a paleontology anchor
-# so generic terms (evolution, species) return on-topic papers.
-# q-bio.PE alone is too narrow; many paleo papers carry no arXiv category.
+# -- Semantic Scholar query construction ---------------------------------------
+# Strip conversational prefixes ("What is", "Tell me about", etc.) so the
+# core subject terms reach the S2 search engine. S2 uses natural-language
+# relevance ranking, not arXiv-style boolean syntax, so we append a single
+# paleontology anchor term only when the query doesn't already contain one.
 _QUESTION_PREFIX = re.compile(
     r"(?i)^\s*"
     r"(?:what(?:\s+(?:is|are|was|were|do|does|did))?|how|why|when|where|who|which|"
     r"tell\s+me\s+(?:about|of)|explain|describe|give\s+me|find|search\s+for)\s+"
 )
 
-_PALEO_ANCHOR = (
-    "(paleontology OR paleobiology OR fossil OR dinosaur OR "
-    "palaeontology OR palaeobiology OR extinct OR prehistoric)"
-)
+_PALEO_TERMS = {
+    "paleontology", "palaeontology", "paleobiology", "palaeobiology",
+    "fossil", "dinosaur", "extinct", "prehistoric",
+}
 
-# arXiv Atom XML namespaces
-_ATOM = "{http://www.w3.org/2005/Atom}"
-_ARXIV_NS = "{http://arxiv.org/schemas/atom}"
-
-# arXiv API base URL (HTTPS)
-_ARXIV_API = "https://export.arxiv.org/api/query"
+_S2_API = "https://api.semanticscholar.org/graph/v1/paper/search"
+_S2_FIELDS = "title,authors,year,abstract,externalIds"
 
 
-def _build_arxiv_query(user_query: str) -> str:
+def _build_s2_query(user_query: str) -> str:
     """
-    Convert a natural-language user query into a focused arXiv search string.
+    Build a Semantic Scholar search query from a natural-language user question.
 
     1. Strip leading question words / conversational prefixes.
     2. Remove trailing punctuation.
-    3. AND with a paleontology domain anchor so generic keywords stay on-topic.
+    3. Append "paleontology" if no domain term is already present, so generic
+       subjects (e.g. "locomotion", "bone structure") return on-topic papers.
 
-    Example:
-      "What new theropod species were named in 2024?"
-      -> "(new theropod species were named in 2024) AND (paleontology OR ...)"
+    S2 uses its own relevance ranking over plain keyword queries; boolean
+    operators (AND/OR) are not needed and can hurt precision here.
     """
     q = _QUESTION_PREFIX.sub("", user_query).rstrip("?.! ").strip()
     if not q:
         q = user_query.strip()
-    arxiv_query = f"({q}) AND {_PALEO_ANCHOR}"
-    logger.info("arXiv query constructed: %r", arxiv_query)
-    return arxiv_query
+    if not any(t in q.lower() for t in _PALEO_TERMS):
+        q = q + " paleontology"
+    logger.info("S2 query constructed: %r", q)
+    return q
 
 
-# -- arXiv pre-fetch -----------------------------------------------------------
-def _fetch_arxiv_abstracts(query: str) -> str:
+# -- Semantic Scholar pre-fetch ------------------------------------------------
+def _fetch_semantic_scholar(query: str) -> str:
     """
-    Fetch arXiv abstracts via direct HTTP to the arXiv REST API.
+    Fetch academic abstracts from the Semantic Scholar Graph API.
 
-    Uses urllib (stdlib) instead of the arxiv library because feedparser
-    (used internally by the library) silently returns empty results on
-    connection/parse failures — no exception is raised, so cloud-side
-    network errors are invisible. Direct HTTP with an explicit timeout
-    surfaces failures as real exceptions that land in the warning log.
+    Endpoint: GET https://api.semanticscholar.org/graph/v1/paper/search
+    Fields:   title, authors, year, abstract, externalIds
+    Auth:     none required for unauthenticated access (rate-limited to
+              ~100 req/s across all anonymous callers — well within app usage)
 
-    Returns a formatted string ready to inject into the user message, or
-    an empty string if no results are found or the request fails.
+    Returns a formatted string ready to inject into the user message, or an
+    empty string if no results are found or the request fails (fails loudly
+    with exception type logged so cloud-side errors are diagnosable).
+
+    Paper identifier priority: ArXiv ID > DOI > S2 paperId.
     """
-    logger.info("Fetching arXiv abstracts for: %r", query)
+    logger.info("Fetching Semantic Scholar abstracts for: %r", query)
     try:
         params = urllib.parse.urlencode({
-            "search_query": _build_arxiv_query(query),
-            "max_results": ARXIV_MAX_RESULTS,
-            "sortBy": "relevance",
+            "query": _build_s2_query(query),
+            "fields": _S2_FIELDS,
+            "limit": S2_MAX_RESULTS,
         })
-        url = f"{_ARXIV_API}?{params}"
-        logger.info("arXiv URL: %s", url)
+        url = f"{_S2_API}?{params}"
+        logger.info("S2 URL: %s", url)
 
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": "paleo-research-assistant/0.8 (research tool)"},
+            headers={"User-Agent": "paleo-research-assistant/0.9 (research tool)"},
         )
-        with urllib.request.urlopen(req, timeout=ARXIV_TIMEOUT) as resp:
-            xml_bytes = resp.read()
+        with urllib.request.urlopen(req, timeout=S2_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
 
-        root = ET.fromstring(xml_bytes)
-        entries = root.findall(f"{_ATOM}entry")
-
-        if not entries:
-            logger.info("arXiv: no results for this query.")
+        papers = payload.get("data", [])
+        if not papers:
+            logger.info("S2: no results for this query.")
             return ""
 
-        logger.info("arXiv: %d result(s) retrieved.", len(entries))
+        logger.info("S2: %d result(s) retrieved.", len(papers))
         sections = []
-        for entry in entries:
-            title = (entry.findtext(f"{_ATOM}title") or "").strip().replace("\n", " ")
-            summary = (entry.findtext(f"{_ATOM}summary") or "").strip()
-            published = (entry.findtext(f"{_ATOM}published") or "")
-            year = published[:4] if published else "n.d."
-            arxiv_id = (entry.findtext(f"{_ATOM}id") or "").strip()
+        for paper in papers:
+            title = (paper.get("title") or "Untitled").strip()
+            abstract = (paper.get("abstract") or "").strip()
+            year = str(paper.get("year") or "n.d.")
 
-            author_names = [
-                (a.findtext(f"{_ATOM}name") or "").strip()
-                for a in entry.findall(f"{_ATOM}author")
-            ]
-            author_names = [n for n in author_names if n]
+            raw_authors = paper.get("authors") or []
+            author_names = [(a.get("name") or "").strip() for a in raw_authors if a.get("name")]
             author_str = ", ".join(author_names[:3])
             if len(author_names) > 3:
                 author_str += " et al."
 
+            ext = paper.get("externalIds") or {}
+            if ext.get("ArXiv"):
+                paper_id = "arXiv:" + ext["ArXiv"]
+            elif ext.get("DOI"):
+                paper_id = "DOI:" + ext["DOI"]
+            else:
+                paper_id = "S2:" + (paper.get("paperId") or "unknown")
+
             block = (
                 "Title: " + title + "\n"
                 + "Authors: " + author_str + " (" + year + ")\n"
-                + "arXiv ID: " + arxiv_id + "\n"
-                + "Abstract: " + summary
+                + "ID: " + paper_id + "\n"
+                + "Abstract: " + abstract
             )
             sections.append(block)
 
         return "\n\n---\n\n".join(sections)
 
     except Exception as exc:
-        logger.warning("arXiv fetch failed (%s): %s", type(exc).__name__, exc)
+        logger.warning("S2 fetch failed (%s): %s", type(exc).__name__, exc)
         return ""
 
 
@@ -224,8 +223,8 @@ def run_agent(query: str, history: list | None = None) -> str:
              Pass None or [] for the first turn.
 
     Steps:
-      1. Pre-fetch arXiv abstracts for the current query and inject into the
-         current user message (prior turns are not re-augmented).
+      1. Pre-fetch Semantic Scholar abstracts for the current query and inject
+         into the current user message (prior turns are not re-augmented).
       2. Build messages = history + [current user message].
       3. Run the agentic loop with native web search.
       4. Concatenate all text blocks from the final response.
@@ -236,14 +235,14 @@ def run_agent(query: str, history: list | None = None) -> str:
     """
     logger.info("Agent received query: %r (history turns: %d)", query, len(history or []))
 
-    arxiv_context = _fetch_arxiv_abstracts(query)
-    if arxiv_context:
+    s2_context = _fetch_semantic_scholar(query)
+    if s2_context:
         user_content = (
             query
-            + "\n\nThe following arXiv abstracts are provided as additional context. "
+            + "\n\nThe following Semantic Scholar abstracts are provided as additional context. "
             + "Incorporate relevant findings and cite them in the arXiv Papers "
             + "section:\n\n"
-            + arxiv_context
+            + s2_context
         )
     else:
         user_content = query
