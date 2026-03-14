@@ -1,0 +1,8 @@
+# Environment variables — never commit secrets
+.env
+
+# Python bytecode
+__pycache__/
+
+# Streamlit secrets
+.streamlit/secrets.toml

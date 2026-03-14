@@ -1,0 +1,7 @@
+# Paleontology Research Assistant — Dependencies
+# V0.1
+
+anthropic>=0.49.0
+streamlit>=1.35.0
+arxiv>=2.1.0         # arXiv API client — abstract retrieval
+python-dotenv>=1.0.0 # API key management via .env
