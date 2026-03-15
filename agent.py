@@ -84,6 +84,9 @@ _TIER1_KEYWORDS = [
     "zookeys",
     "peerj",
     "elife",
+    "palaeo-electronica.org",
+    "palaeoelectronica",
+    "palaeontologia electronica",
 ]
 
 _TIER2_KEYWORDS = [
@@ -135,7 +138,7 @@ _TIER3_KEYWORDS = [
 
 # Regex to strip any existing [T1]-[T4] label before re-annotating,
 # preventing double-labelling when Claude follows the system prompt instruction.
-_EXISTING_TIER_LABEL = re.compile(r"\s*\[T[1-4]\]\s*$")
+_EXISTING_TIER_LABEL = re.compile(r"\s*\[T[1-4]\]")
 
 
 # -- System prompt -------------------------------------------------------------
