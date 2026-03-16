@@ -1,11 +1,12 @@
 """
 Paleontology Research Assistant -- Agent Loop
-V1.0: Add deterministic source quality scoring. Tier rules are injected into
-      the system prompt before every API call so Claude can prioritise high-
-      quality sources during synthesis. After the response is received,
-      _annotate_tier_labels() scores each Sources bullet by keyword-matching
-      the URL and title, logs the match, and appends [T1]-[T4] in-place.
-      No LLM involvement in scoring; all pattern matching is pure Python.
+V1.1: Autonomous multi-search loop. After the initial research pass, a
+      deterministic gap analysis scans the output for uncertainty signals and
+      Open Questions bullets, generates up to 2 targeted follow-up queries,
+      runs them as additional search passes (3 passes total max), and merges
+      results into a 'Further Research' section before final tier annotation.
+      No LLM involvement in gap detection or query generation; all pattern
+      matching is pure Python.
 """
 
 import json
@@ -31,7 +32,9 @@ client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from .env automaticall
 # -- Config --------------------------------------------------------------------
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
-MAX_LOOP_ITERATIONS = 5    # guard against runaway loops
+MAX_LOOP_ITERATIONS = 5    # guard against runaway inner loops
+MAX_PASSES = 3             # 1 initial + up to 2 follow-up searches
+MAX_FOLLOWUP_QUERIES = 2   # follow-up searches per run_agent call
 S2_MAX_RESULTS = 5
 S2_TIMEOUT = 15            # seconds
 
@@ -62,7 +65,7 @@ _TIER1_KEYWORDS = [
     "peerj.com",
     "jstor.org",
     "pubmed", "ncbi.nlm.nih.gov",
-    "doi.org/10.",
+    "doi.org/10.", "doi:10.",
     "vertpaleo.org",
     "paleosoc.org",
     "pensoft.net",
@@ -103,6 +106,7 @@ _TIER2_KEYWORDS = [
     "paleobiodb.org",
     "fossilworks.org",
     "usgs.gov", "nps.gov",
+    "ufhealth.org",
     # Text patterns that appear in Claude's citations
     "natural history museum",
     "university press",
@@ -140,6 +144,28 @@ _TIER3_KEYWORDS = [
 # preventing double-labelling when Claude follows the system prompt instruction.
 _EXISTING_TIER_LABEL = re.compile(r"\s*\[T[1-4]\]")
 
+# -- Gap analysis patterns -----------------------------------------------------
+# Matched against the full response text to detect uncertainty signals.
+# Used for logging the gap signal count; Open Questions bullets are the primary
+# source of follow-up queries.
+_GAP_SIGNAL_RE = re.compile(
+    r"\b(?:remains?\s+unclear|is\s+debated|further\s+research\s+(?:is\s+)?needed|"
+    r"unknown|uncertain(?:ty)?|not\s+yet\s+(?:known|determined|understood)|"
+    r"poorly\s+understood|little\s+is\s+known|limited\s+evidence|"
+    r"more\s+research|needs?\s+(?:further|more)\s+(?:study|research|investigation))\b",
+    re.IGNORECASE,
+)
+
+# Captures all bullet lines under the '### Open Questions' heading.
+_OPEN_Q_RE = re.compile(
+    r"###\s+Open\s+Questions\s*\n((?:[ \t]*-[ \t]+.+\n?)*)",
+    re.IGNORECASE,
+)
+
+# Guards _annotate_tier_labels: a bullet line is only scored if it looks like
+# an actual citation — contains a URL or a 4-digit publication year.
+_CITATION_LINE_RE = re.compile(r"https?://|\b(19|20)\d{2}\b")
+
 
 # -- System prompt -------------------------------------------------------------
 SYSTEM_PROMPT = """You are a paleontology research assistant with access to live web search
@@ -162,8 +188,11 @@ this exact format:
 - [paper title, authors, year, paper ID]
 
 ### Sources
-- [web source or reference 1]
-- [web source or reference 2]
+- [Title](URL)
+- Title (Publication, Year)
+
+Format each source as a markdown link - [Title](URL) - when a URL is available.
+If no URL is available, write - Title (Publication, Year) with no placeholder characters.
 
 ### Open Questions
 - [open question 1]
@@ -187,6 +216,30 @@ Cite academic papers in the arXiv Papers section using their IDs.
 Cite web results in Sources. Be specific and accurate. If you are uncertain
 about something, say so rather than speculating.
 Keep findings concise -- one to two sentences each."""
+
+
+# -- Follow-up search system prompt --------------------------------------------
+_FOLLOWUP_SYSTEM_PROMPT = """You are a paleontology research assistant filling a specific knowledge gap
+identified in a prior research pass. Use web search to find current information
+directly addressing the provided gap or open question. Return your findings in
+this exact format:
+
+**Gap addressed:** [restate the gap or question]
+
+**New Findings:**
+- [finding 1]
+- [finding 2]
+
+### Sources
+- [source 1]
+- [source 2]
+
+Keep findings concise (one to two sentences each) and directly relevant to the gap.
+Add a [T1]-[T4] tier label to every Sources bullet:
+  [T1] Peer-reviewed journal
+  [T2] Institutional / museum source
+  [T3] Science journalism
+  [T4] General news or blog"""
 
 
 # -- Source quality scoring ----------------------------------------------------
@@ -221,6 +274,7 @@ def _annotate_tier_labels(text: str) -> str:
     _score_source(), strips any label Claude may have already added to
     prevent duplicates, appends the authoritative label, and logs each
     assignment.  Lines outside the Sources section are returned unchanged.
+    Handles multiple '### Sources' sections (e.g. in Further Research).
     """
     lines = text.split("\n")
     result = []
@@ -238,6 +292,9 @@ def _annotate_tier_labels(text: str) -> str:
             in_sources = False
 
         if in_sources and stripped.startswith("- "):
+            if not _CITATION_LINE_RE.search(stripped):
+                result.append(line)
+                continue
             base = _EXISTING_TIER_LABEL.sub("", line.rstrip())
             tier, matched = _score_source(base)
             logger.info("Source tier T%d (matched %r): %s", tier, matched, base.strip()[:100])
@@ -369,6 +426,88 @@ def _extract_final_text(content: list) -> str | None:
     return "".join(b.text for b in text_blocks) if text_blocks else None
 
 
+# -- Query cleaning ------------------------------------------------------------
+_MD_EMPHASIS_RE = re.compile(r"\*+(.+?)\*+")
+
+
+def _clean_query(text: str) -> str:
+    """Strip markdown bold (**text**) and italic (*text*) markers from a query string."""
+    return _MD_EMPHASIS_RE.sub(r"\1", text).strip()
+
+
+# -- Gap analysis --------------------------------------------------------------
+def _extract_followup_queries(text: str) -> list[str]:
+    """
+    Extract up to MAX_FOLLOWUP_QUERIES follow-up search queries from the text.
+
+    Priority 1: Open Questions bullets — used directly as queries since they
+                are already in question form and represent the most explicit gaps.
+    Priority 2: Lines containing uncertainty signal phrases — used if Priority 1
+                yields fewer than MAX_FOLLOWUP_QUERIES queries.
+
+    Returns a deduplicated list capped at MAX_FOLLOWUP_QUERIES.
+    """
+    queries: list[str] = []
+
+    # Priority 1 — Open Questions bullets
+    oq_match = _OPEN_Q_RE.search(text)
+    if oq_match:
+        for raw in oq_match.group(1).splitlines():
+            q = raw.strip().lstrip("- ").strip()
+            if q and q not in queries:
+                queries.append(q)
+                if len(queries) >= MAX_FOLLOWUP_QUERIES:
+                    return queries
+
+    # Priority 2 — lines with uncertainty signal phrases
+    for line in text.splitlines():
+        if len(queries) >= MAX_FOLLOWUP_QUERIES:
+            break
+        stripped = line.strip().lstrip("- ").strip()
+        if _GAP_SIGNAL_RE.search(stripped) and 20 < len(stripped) < 250:
+            if stripped not in queries:
+                queries.append(stripped)
+
+    return queries[:MAX_FOLLOWUP_QUERIES]
+
+
+# -- Inner agentic loop --------------------------------------------------------
+def _run_pass(messages: list, system_prompt: str, max_tokens: int = MAX_TOKENS) -> str | None:
+    """
+    Execute one agentic pass: call the API, handle pause_turn continuations,
+    and return concatenated text on end_turn. Returns None if end_turn is
+    never reached within MAX_LOOP_ITERATIONS.
+
+    Mutates `messages` in place when appending assistant turns during
+    pause_turn handling (same pattern as the original inline loop).
+    """
+    for iteration in range(MAX_LOOP_ITERATIONS):
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=max_tokens,
+            system=system_prompt,
+            tools=TOOLS,
+            tool_choice={"type": "any"},
+            messages=messages,
+        )
+
+        logger.info("  iteration %d: stop_reason=%r", iteration + 1, response.stop_reason)
+        _log_content_blocks(response.content)
+
+        if response.stop_reason == "end_turn":
+            return _extract_final_text(response.content)
+
+        if response.stop_reason == "pause_turn":
+            messages.append({"role": "assistant", "content": response.content})
+            continue
+
+        logger.warning("Unexpected stop_reason: %r", response.stop_reason)
+        messages.append({"role": "assistant", "content": response.content})
+
+    logger.warning("Pass exhausted %d iterations without end_turn.", MAX_LOOP_ITERATIONS)
+    return None
+
+
 # -- Agent entry point ---------------------------------------------------------
 def run_agent(query: str, history: list | None = None) -> str:
     """
@@ -380,17 +519,21 @@ def run_agent(query: str, history: list | None = None) -> str:
 
     Steps:
       1. Pre-fetch Semantic Scholar abstracts; inject into current user message.
-      2. Build messages = history + [current user message].
-      3. Run the agentic loop with native web search.
-      4. Concatenate all text blocks from the final response.
-      5. Apply deterministic tier labels to the Sources section.
+      2. Pass 1 — run the initial agentic loop with native web search.
+      3. Gap analysis — count uncertainty signals; extract Open Questions as
+         follow-up queries (up to MAX_FOLLOWUP_QUERIES).
+      4. Passes 2–MAX_PASSES — run one targeted follow-up search per query.
+      5. Merge initial text + supplemental results into a 'Further Research'
+         section (if any follow-ups returned content).
+      6. Apply deterministic tier labels to all Sources sections and return.
 
-    stop_reason flow:
-      end_turn   -> done; extract, annotate tiers, and return text.
+    stop_reason flow inside each pass:
+      end_turn   -> done; extract text and return to caller.
       pause_turn -> server hit its iteration cap; append and continue.
     """
     logger.info("Agent received query: %r (history turns: %d)", query, len(history or []))
 
+    # -- Pass 1: initial research ----------------------------------------------
     s2_context = _fetch_semantic_scholar(query)
     if s2_context:
         user_content = (
@@ -406,42 +549,61 @@ def run_agent(query: str, history: list | None = None) -> str:
     messages = list(history or []) + [{"role": "user", "content": user_content}]
 
     try:
-        for iteration in range(MAX_LOOP_ITERATIONS):
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                tools=TOOLS,
-                tool_choice={"type": "any"},   # force web_search invocation
-                messages=messages,
+        logger.info("Pass 1 — initial research")
+        initial_text = _run_pass(messages, SYSTEM_PROMPT)
+        if not initial_text:
+            logger.warning("Pass 1 returned no text.")
+            return (
+                "## Research Summary\n\n"
+                "**Status:** The research assistant reached its iteration limit. "
+                "Please try a more specific query."
             )
+        logger.info("Pass 1 complete.")
 
-            logger.info(
-                "Iteration %d: stop_reason=%r", iteration + 1, response.stop_reason
-            )
-            _log_content_blocks(response.content)
-
-            if response.stop_reason == "end_turn":
-                text = _extract_final_text(response.content)
-                if text:
-                    text = _annotate_tier_labels(text)
-                    logger.info("Agent completed successfully.")
-                    return text
-                return "## Research Summary\n\n**Status:** No text response received."
-
-            if response.stop_reason == "pause_turn":
-                messages.append({"role": "assistant", "content": response.content})
-                continue
-
-            logger.warning("Unexpected stop_reason: %r", response.stop_reason)
-            messages.append({"role": "assistant", "content": response.content})
-
-        logger.warning("Agent loop exhausted without reaching end_turn.")
-        return (
-            "## Research Summary\n\n"
-            "**Status:** The research assistant reached its iteration limit. "
-            "Please try a more specific query."
+        # -- Gap analysis ------------------------------------------------------
+        signal_count = len(_GAP_SIGNAL_RE.findall(initial_text))
+        followup_queries = _extract_followup_queries(initial_text)
+        logger.info(
+            "Gap analysis: %d uncertainty signal(s), %d follow-up quer%s generated",
+            signal_count,
+            len(followup_queries),
+            "y" if len(followup_queries) == 1 else "ies",
         )
+
+        # -- Passes 2–MAX_PASSES: targeted follow-up searches ------------------
+        supplementals: list[str] = []
+        for pass_num, fq in enumerate(followup_queries[:MAX_PASSES - 1], start=2):
+            fq = _clean_query(fq)
+            logger.info("Pass %d — follow-up search: %r", pass_num, fq)
+            fq_messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        f"In research about '{query}', this gap or open question was identified:\n\n"
+                        f"{fq}\n\n"
+                        f"Please search for current information directly addressing this gap."
+                    ),
+                }
+            ]
+            supp = _run_pass(fq_messages, _FOLLOWUP_SYSTEM_PROMPT, max_tokens=2048)
+            if supp:
+                supplementals.append(supp)
+                logger.info("Pass %d complete.", pass_num)
+            else:
+                logger.warning("Pass %d returned no text.", pass_num)
+
+        # -- Merge and annotate ------------------------------------------------
+        if supplementals:
+            further = "\n\n### Further Research\n\n" + "\n\n---\n\n".join(supplementals)
+            final_text = initial_text + further
+        else:
+            final_text = initial_text
+
+        final_text = _annotate_tier_labels(final_text)
+        logger.info(
+            "Agent completed successfully (%d pass(es) total).", 1 + len(supplementals)
+        )
+        return final_text
 
     except Exception as exc:
         logger.error("Claude API call failed: %s", exc)
