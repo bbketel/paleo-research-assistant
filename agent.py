@@ -231,8 +231,11 @@ this exact format:
 - [finding 2]
 
 ### Sources
-- [source 1]
-- [source 2]
+- [Title](URL)
+- Title (Publication, Year)
+
+Format each source as a markdown link - [Title](URL) - when a URL is available.
+If no URL is available, write - Title (Publication, Year) with no placeholder characters.
 
 Keep findings concise (one to two sentences each) and directly relevant to the gap.
 Add a [T1]-[T4] tier label to every Sources bullet:
