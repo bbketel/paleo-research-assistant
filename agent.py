@@ -9,6 +9,7 @@ V1.2: Persistent memory via ChromaDB. Prior research sessions are retrieved
 import json
 import logging
 import re
+import time
 import urllib.parse
 import urllib.request
 import anthropic
@@ -31,7 +32,7 @@ client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from .env automaticall
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
 MAX_LOOP_ITERATIONS = 5    # guard against runaway inner loops
-MAX_PASSES = 3             # 1 initial + up to 2 follow-up searches
+MAX_PASSES = 2             # 1 initial + 1 follow-up (free-tier rate limit; raise to 3 on paid tier)
 MAX_FOLLOWUP_QUERIES = 2   # follow-up searches per run_agent call
 PRIOR_SESSIONS = 3         # similar past sessions to inject as context
 PRIOR_MAX_CHARS = 600      # truncation limit per injected session
@@ -593,6 +594,8 @@ def run_agent(query: str, history: list | None = None) -> str:
         supplementals: list[str] = []
         for pass_num, fq in enumerate(followup_queries[:MAX_PASSES - 1], start=2):
             fq = _clean_query(fq)
+            logger.info("Waiting 60s before follow-up search to fully reset token window...")
+            time.sleep(60)
             logger.info("Pass %d — follow-up search: %r", pass_num, fq)
             fq_messages = [
                 {
