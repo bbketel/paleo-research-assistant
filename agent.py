@@ -1,12 +1,9 @@
 """
 Paleontology Research Assistant -- Agent Loop
-V1.1: Autonomous multi-search loop. After the initial research pass, a
-      deterministic gap analysis scans the output for uncertainty signals and
-      Open Questions bullets, generates up to 2 targeted follow-up queries,
-      runs them as additional search passes (3 passes total max), and merges
-      results into a 'Further Research' section before final tier annotation.
-      No LLM involvement in gap detection or query generation; all pattern
-      matching is pure Python.
+V1.2: Persistent memory via ChromaDB. Prior research sessions are retrieved
+      at the start of each query and injected as context so Claude builds on
+      previous work rather than repeating it. Completed sessions are saved to
+      ./memory_db after tier annotation. Memory logic lives in memory.py.
 """
 
 import json
@@ -16,6 +13,7 @@ import urllib.parse
 import urllib.request
 import anthropic
 from dotenv import load_dotenv
+from memory import memory
 
 load_dotenv()
 
@@ -35,6 +33,8 @@ MAX_TOKENS = 4096
 MAX_LOOP_ITERATIONS = 5    # guard against runaway inner loops
 MAX_PASSES = 3             # 1 initial + up to 2 follow-up searches
 MAX_FOLLOWUP_QUERIES = 2   # follow-up searches per run_agent call
+PRIOR_SESSIONS = 3         # similar past sessions to inject as context
+PRIOR_MAX_CHARS = 1500     # truncation limit per injected session
 S2_MAX_RESULTS = 5
 S2_TIMEOUT = 15            # seconds
 
@@ -537,18 +537,34 @@ def run_agent(query: str, history: list | None = None) -> str:
     logger.info("Agent received query: %r (history turns: %d)", query, len(history or []))
 
     # -- Pass 1: initial research ----------------------------------------------
+    content_parts = [query]
+
+    # Inject semantically similar prior sessions so Claude builds on past work.
+    prior_sessions = memory.retrieve(query, k=PRIOR_SESSIONS)
+    if prior_sessions:
+        prior_blocks = [
+            "--- Prior Research ---",
+            "The following are results from similar previous research sessions. "
+            "Build on these findings rather than repeating them.",
+        ]
+        for i, s in enumerate(prior_sessions, 1):
+            snippet = s["response"][:PRIOR_MAX_CHARS]
+            if len(s["response"]) > PRIOR_MAX_CHARS:
+                snippet += "\n[...truncated]"
+            prior_blocks.append(f"\n[Session {i} — Query: {s['query']!r}]\n{snippet}")
+        prior_blocks.append("--- End Prior Research ---")
+        content_parts.append("\n".join(prior_blocks))
+        logger.info("Memory: injecting %d prior session(s) as context.", len(prior_sessions))
+
     s2_context = _fetch_semantic_scholar(query)
     if s2_context:
-        user_content = (
-            query
-            + "\n\nThe following Semantic Scholar abstracts are provided as additional context. "
-            + "Incorporate relevant findings and cite them in the arXiv Papers "
-            + "section:\n\n"
-            + s2_context
+        content_parts.append(
+            "The following Semantic Scholar abstracts are provided as additional context. "
+            "Incorporate relevant findings and cite them in the arXiv Papers "
+            "section:\n\n" + s2_context
         )
-    else:
-        user_content = query
 
+    user_content = "\n\n".join(content_parts)
     messages = list(history or []) + [{"role": "user", "content": user_content}]
 
     try:
@@ -606,6 +622,7 @@ def run_agent(query: str, history: list | None = None) -> str:
         logger.info(
             "Agent completed successfully (%d pass(es) total).", 1 + len(supplementals)
         )
+        memory.save(query, final_text)
         return final_text
 
     except Exception as exc:

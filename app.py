@@ -10,6 +10,7 @@ V0.3: Four UI improvements:
 import re
 import streamlit as st
 from agent import run_agent
+from memory import memory
 
 # -- Page config ---------------------------------------------------------------
 st.set_page_config(
@@ -84,6 +85,14 @@ with st.sidebar:
         " &nbsp;General news or blog",
         unsafe_allow_html=True,
     )
+
+    st.divider()
+    st.markdown("**Memory**")
+    mem_count = memory.count()
+    st.caption(f"{mem_count} research session{'s' if mem_count != 1 else ''} stored")
+    if st.button("Clear memory", use_container_width=True):
+        memory.clear()
+        st.rerun()
 
 # -- Title ---------------------------------------------------------------------
 st.title("🦕 Paleontology Research Assistant")
