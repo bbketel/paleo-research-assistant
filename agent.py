@@ -34,7 +34,7 @@ MAX_LOOP_ITERATIONS = 5    # guard against runaway inner loops
 MAX_PASSES = 3             # 1 initial + up to 2 follow-up searches
 MAX_FOLLOWUP_QUERIES = 2   # follow-up searches per run_agent call
 PRIOR_SESSIONS = 3         # similar past sessions to inject as context
-PRIOR_MAX_CHARS = 1500     # truncation limit per injected session
+PRIOR_MAX_CHARS = 600      # truncation limit per injected session
 S2_MAX_RESULTS = 5
 S2_TIMEOUT = 15            # seconds
 
