@@ -184,7 +184,7 @@ this exact format:
 - [finding 2]
 - [finding 3]
 
-### arXiv Papers
+### Academic Papers
 - [paper title, authors, year, paper ID]
 - [paper title, authors, year, paper ID]
 
@@ -213,7 +213,9 @@ When T1 or T2 sources conflict with T3 or T4 on the same finding, weight
 the higher-tier source. Add a [T1]-[T4] label to every Sources bullet.
 
 Always use web search before answering. Incorporate Semantic Scholar abstracts where relevant.
-Cite academic papers in the arXiv Papers section using their IDs.
+Cite academic papers in the Academic Papers section using their IDs. Omit the
+Academic Papers section entirely if no relevant papers were identified — do not
+write a placeholder or "no papers found" line.
 Cite web results in Sources. Be specific and accurate. If you are uncertain
 about something, say so rather than speculating.
 Keep findings concise -- one to two sentences each."""
@@ -292,7 +294,7 @@ def _annotate_tier_labels(text: str) -> str:
             in_sources = True
             result.append(line)
             continue
-        if in_sources and stripped.startswith("##"):
+        if in_sources and (stripped.startswith("### Academic Papers") or stripped.startswith("##")):
             in_sources = False
 
         if in_sources and stripped.startswith("- "):
@@ -561,7 +563,7 @@ def run_agent(query: str, history: list | None = None) -> str:
     if s2_context:
         content_parts.append(
             "The following Semantic Scholar abstracts are provided as additional context. "
-            "Incorporate relevant findings and cite them in the arXiv Papers "
+            "Incorporate relevant findings and cite them in the Academic Papers "
             "section:\n\n" + s2_context
         )
 
