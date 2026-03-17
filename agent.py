@@ -36,6 +36,7 @@ MAX_PASSES = 2             # 1 initial + 1 follow-up (free-tier rate limit; rais
 MAX_FOLLOWUP_QUERIES = 2   # follow-up searches per run_agent call
 PRIOR_SESSIONS = 3         # similar past sessions to inject as context
 PRIOR_MAX_CHARS = 600      # truncation limit per injected session
+MAX_CONFLICTS = 3          # cap on detected source conflicts per response
 S2_MAX_RESULTS = 5
 S2_TIMEOUT = 15            # seconds
 
@@ -167,6 +168,28 @@ _OPEN_Q_RE = re.compile(
 # an actual citation — contains a URL or a 4-digit publication year.
 _CITATION_LINE_RE = re.compile(r"https?://|\b(19|20)\d{2}\b")
 
+# -- Conflict detection patterns -----------------------------------------------
+# Matched against Key Findings bullets to detect claims where sources disagree.
+_CONFLICT_SIGNAL_RE = re.compile(
+    r"\b(?:however|in\s+contrast|disputed|challenged|debated?|contested|"
+    r"some\s+researchers?\s+(?:argue|suggest|claim|contend)|"
+    r"others?\s+(?:argue|suggest|claim)|contradicts?|conflicting|"
+    r"disagree|inconsistent\s+with|at\s+odds)\b",
+    re.IGNORECASE,
+)
+
+# Captures bullet lines under '### Key Findings'.
+_KEY_FINDINGS_RE = re.compile(
+    r"###\s+Key\s+Findings\s*\n((?:[ \t]*-[ \t]+.+\n?)*)",
+    re.IGNORECASE,
+)
+
+# Captures bullet lines under the first '### Sources' section.
+_SOURCES_SECTION_RE = re.compile(
+    r"###\s+Sources\s*\n((?:[ \t]*-[ \t]+.+\n?)*)",
+    re.IGNORECASE,
+)
+
 
 # -- System prompt -------------------------------------------------------------
 SYSTEM_PROMPT = """You are a paleontology research assistant with access to live web search
@@ -246,6 +269,20 @@ Add a [T1]-[T4] tier label to every Sources bullet:
   [T2] Institutional / museum source
   [T3] Science journalism
   [T4] General news or blog"""
+
+
+# -- Conflict summary system prompt --------------------------------------------
+_CONFLICT_SYSTEM_PROMPT = """You are a paleontology research assistant summarising factual conflicts between sources.
+Given research findings that contain conflicting evidence and the high-quality (T1/T2)
+sources involved, write a concise ### Source Conflicts section.
+
+Format exactly as:
+
+### Source Conflicts
+- [One to two sentences describing the disagreement and which positions or sources conflict]
+
+List only genuine factual disagreements. Do not add placeholder text if no clear conflict
+exists. Do not repeat findings verbatim — describe the nature of the disagreement."""
 
 
 # -- Source quality scoring ----------------------------------------------------
@@ -441,6 +478,89 @@ def _clean_query(text: str) -> str:
     return _MD_EMPHASIS_RE.sub(r"\1", text).strip()
 
 
+# -- Conflict detection --------------------------------------------------------
+def _detect_conflicts(text: str) -> list[str]:
+    """
+    Extract Key Findings bullets that contain conflict signal phrases.
+
+    Returns a deduplicated list of conflicting finding strings, capped at
+    MAX_CONFLICTS. Detection is purely regex-based — no LLM involvement.
+    """
+    kf_match = _KEY_FINDINGS_RE.search(text)
+    if not kf_match:
+        return []
+    conflicts: list[str] = []
+    for raw in kf_match.group(1).splitlines():
+        bullet = raw.strip().lstrip("- ").strip()
+        if bullet and _CONFLICT_SIGNAL_RE.search(bullet):
+            if bullet not in conflicts:
+                conflicts.append(bullet)
+                if len(conflicts) >= MAX_CONFLICTS:
+                    break
+    return conflicts
+
+
+def _extract_high_tier_sources(text: str) -> list[str]:
+    """
+    Return T1 and T2 source lines from the first ### Sources section.
+
+    Tier scoring is done inline with _score_source() since tier labels may
+    not yet be annotated on the text at the time this is called.
+    """
+    src_match = _SOURCES_SECTION_RE.search(text)
+    if not src_match:
+        return []
+    high_tier: list[str] = []
+    for raw in src_match.group(1).splitlines():
+        bullet = raw.strip()
+        if bullet.startswith("- "):
+            content = bullet[2:].strip()
+            tier, _ = _score_source(content)
+            if tier <= 2:
+                high_tier.append(content)
+    return high_tier
+
+
+def _generate_conflict_section(conflicts: list[str], sources: list[str]) -> str | None:
+    """
+    Make a focused LLM call (no web search) to produce a ### Source Conflicts section.
+
+    Uses only the conflicting findings and T1/T2 sources as input, keeping the
+    call small. Returns the raw text block, or None on failure.
+    """
+    user_content = (
+        "The following research findings contain conflicting evidence:\n\n"
+        + "\n".join(f"- {c}" for c in conflicts)
+        + "\n\nHigh-quality sources (T1/T2) from this research session:\n\n"
+        + "\n".join(f"- {s}" for s in sources[:6])
+        + "\n\nWrite a ### Source Conflicts section summarising the key disagreements."
+    )
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=512,
+            system=_CONFLICT_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_content}],
+        )
+        text_blocks = [b for b in response.content if hasattr(b, "text")]
+        return "".join(b.text for b in text_blocks) if text_blocks else None
+    except Exception as exc:
+        logger.warning("Conflict section generation failed: %s", exc)
+        return None
+
+
+def _insert_conflict_section(text: str, conflict_section: str) -> str:
+    """
+    Insert the conflict section immediately before ### Open Questions.
+    Falls back to appending at the end of the text if the marker is not found.
+    """
+    marker = "### Open Questions"
+    idx = text.find(marker)
+    if idx != -1:
+        return text[:idx] + conflict_section.rstrip() + "\n\n" + text[idx:]
+    return text + "\n\n" + conflict_section.rstrip()
+
+
 # -- Gap analysis --------------------------------------------------------------
 def _extract_followup_queries(text: str) -> list[str]:
     """
@@ -581,6 +701,20 @@ def run_agent(query: str, history: list | None = None) -> str:
                 "Please try a more specific query."
             )
         logger.info("Pass 1 complete.")
+
+        # -- Conflict detection ------------------------------------------------
+        conflicting_findings = _detect_conflicts(initial_text)
+        high_tier_sources = _extract_high_tier_sources(initial_text)
+        logger.info(
+            "Conflict detection: %d conflicting finding(s), %d T1/T2 source(s) found",
+            len(conflicting_findings),
+            len(high_tier_sources),
+        )
+        if conflicting_findings and len(high_tier_sources) >= 2:
+            conflict_section = _generate_conflict_section(conflicting_findings, high_tier_sources)
+            if conflict_section:
+                initial_text = _insert_conflict_section(initial_text, conflict_section)
+                logger.info("Source Conflicts section added.")
 
         # -- Gap analysis ------------------------------------------------------
         signal_count = len(_GAP_SIGNAL_RE.findall(initial_text))
