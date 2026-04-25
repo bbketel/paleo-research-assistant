@@ -711,6 +711,8 @@ def run_agent(query: str, history: list | None = None) -> str:
             len(high_tier_sources),
         )
         if conflicting_findings and len(high_tier_sources) >= 2:
+            logger.info("Waiting 15s before conflict generation...")
+            time.sleep(15)
             conflict_section = _generate_conflict_section(conflicting_findings, high_tier_sources)
             if conflict_section:
                 initial_text = _insert_conflict_section(initial_text, conflict_section)
